@@ -14,36 +14,39 @@ import (
 	"adventureride/routes"
 )
 
-var collection *mongo.Collection
-
 func main() {
-	// Load environment variables from the .env file
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("Error loading .env file")
-		return
-	}
+    // Load environment variables from the .env file
+    if err := godotenv.Load(); err != nil {
+        fmt.Println("Error loading .env file")
+        return
+    }
 
-	// Get the MongoDB URI from the environment variable
-	mongoURI := os.Getenv("MONGODB_URI")
+    // Get the MongoDB URI from the environment variable
+    mongoURI := os.Getenv("MONGODB_URI")
 
-	// Initialize the Gin router
-	r := gin.Default()
+    // Initialize the Gin router
+    r := gin.Default()
 
-	// Connect to MongoDB Atlas
-	client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(mongoURI))
-	if err != nil {
-		fmt.Println("Failed to connect to MongoDB Atlas")
-		return
-	}
-	defer client.Disconnect(context.TODO())
-	collection = client.Database("AdventureRide").Collection("Users")
+    // Connect to MongoDB Atlas
+    client, err := mongo.Connect(context.TODO(), options.Client().ApplyURI(mongoURI))
+    if err != nil {
+        fmt.Println("Failed to connect to MongoDB Atlas")
+        return
+    }
+    defer client.Disconnect(context.TODO())
 
-	// Create a controller and pass the collection
-	ctrl := &controllers.Controller{Collection: collection}
+    // Create collections for users and trips
+    userCollection := client.Database("AdventureRide").Collection("Users")
+    tripCollection := client.Database("AdventureRide").Collection("Trips")
 
-	// Set up routes and pass the controller
-	routes.SetupRoutes(r, ctrl)
+    // Create controllers for users and trips
+    userController := &controllers.Controller{Collection: userCollection}
+    tripController := &controllers.TripController{Collection: tripCollection}
 
-	// Start the web server
-	r.Run(":8080")
+    // Set up routes for User and Trip controllers
+    routes.SetupUserRoutes(r, userController)
+    routes.SetupTripRoutes(r, tripController)
+
+    // Start the web server
+    r.Run(":8080")
 }
