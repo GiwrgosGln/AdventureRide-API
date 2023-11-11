@@ -2,8 +2,8 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"net/http"
-
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,12 +16,25 @@ import (
 	"github.com/dgrijalva/jwt-go"
 )
 
-// Define a secret key for signing JWT tokens.
+// Define secret keys for signing JWT tokens and refresh tokens.
 var jwtSecret = []byte("your-secret-key")
+var refreshTokenSecret = []byte("your-refresh-token-secret")
 
 type Controller struct {
 	Collection *mongo.Collection
 }
+
+// TokenDetails holds the access token and refresh token.
+type TokenDetails struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+// Constants for token expiration times.
+const (
+	AccessTokenExpireTime  = time.Hour * 24      // 1 day
+	RefreshTokenExpireTime = time.Hour * 24 * 7  // 7 days
+)
 
 func (ctrl *Controller) RegisterHandler(c *gin.Context) {
 	var user models.User
@@ -50,45 +63,74 @@ func (ctrl *Controller) RegisterHandler(c *gin.Context) {
 }
 
 func (ctrl *Controller) LoginHandler(c *gin.Context) {
-	var loginData struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	err := c.ShouldBindJSON(&loginData)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+    var loginData struct {
+        Username string `json:"username"`
+        Password string `json:"password"`
+    }
+    err := c.ShouldBindJSON(&loginData)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
 
-	// Retrieve the user from MongoDB Atlas by username or email
-	var user models.User
-	err = ctrl.Collection.FindOne(context.TODO(), bson.M{"$or": []bson.M{{"username": loginData.Username}, {"email": loginData.Username}}}).Decode(&user)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-		return
-	}
+    // Retrieve the user from MongoDB Atlas by username or email
+    var user models.User
+    err = ctrl.Collection.FindOne(context.TODO(), bson.M{"$or": []bson.M{{"username": loginData.Username}, {"email": loginData.Username}}}).Decode(&user)
+    if err != nil {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+        return
+    }
 
-	// Verify the hashed password
-	if !utils.CheckPasswordHash(loginData.Password, user.Password) {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-		return
-	}
+    // Verify the hashed password
+    if !utils.CheckPasswordHash(loginData.Password, user.Password) {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+        return
+    }
 
-	// Generate a JWT token
-	token, err := ctrl.GenerateToken(user)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token generation failed"})
-		return
-	}
+    // Generate access and refresh tokens
+    tokenDetails, err := ctrl.GenerateTokens(user)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Token generation failed"})
+        return
+    }
 
-	c.JSON(http.StatusOK, gin.H{"token": token})
+    // Include user ID and name in the response
+    c.JSON(http.StatusOK, gin.H{
+        "access_token":  tokenDetails.AccessToken,
+        "refresh_token": tokenDetails.RefreshToken,
+        "user_id":       user.ID.Hex(),
+        "username":      user.Username,
+    })
 }
 
-func (ctrl *Controller) GenerateToken(user models.User) (string, error) {
+
+func (ctrl *Controller) GenerateTokens(user models.User) (*TokenDetails, error) {
+	// Generate access token
+	accessToken, err := ctrl.generateToken(user.Username, user.ID.Hex(), AccessTokenExpireTime)
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate refresh token
+	refreshToken, err := ctrl.generateToken(user.Username, user.ID.Hex(), RefreshTokenExpireTime)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store the refresh token in a secure way (e.g., database)
+
+	return &TokenDetails{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+	}, nil
+}
+
+func (ctrl *Controller) generateToken(username, userID string, expirationTime time.Duration) (string, error) {
 	token := jwt.New(jwt.GetSigningMethod("HS256"))
 	claims := token.Claims.(jwt.MapClaims)
-	claims["username"] = user.Username // Use an appropriate field as the identifier
-	claims["exp"] = time.Now().Add(time.Hour * 24).Unix() // Token expiration time
+	claims["username"] = username
+	claims["user_id"] = userID
+	claims["exp"] = time.Now().Add(expirationTime).Unix()
 
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
@@ -98,3 +140,60 @@ func (ctrl *Controller) GenerateToken(user models.User) (string, error) {
 	return tokenString, nil
 }
 
+
+
+func (ctrl *Controller) RefreshTokenHandler(c *gin.Context) {
+	// Extract the refresh token from the request
+	var refreshTokenData struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	err := c.ShouldBindJSON(&refreshTokenData)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid refresh token"})
+		return
+	}
+
+	// Validate the refresh token
+	username, err := ctrl.ValidateRefreshToken(refreshTokenData.RefreshToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token"})
+		return
+	}
+
+	// Generate a new access and refresh token pair
+	user := models.User{Username: username} // You might need to fetch user details from the database
+	tokenDetails, err := ctrl.GenerateTokens(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Token generation failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"access_token": tokenDetails.AccessToken, "refresh_token": tokenDetails.RefreshToken})
+}
+
+func (ctrl *Controller) ValidateRefreshToken(refreshToken string) (string, error) {
+	token, err := jwt.Parse(refreshToken, func(token *jwt.Token) (interface{}, error) {
+		// Validate the signing method
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Invalid signing method")
+		}
+
+		return refreshTokenSecret, nil
+	})
+	if err != nil || !token.Valid {
+		return "", err
+	}
+
+	// Extract username from claims
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", fmt.Errorf("Invalid token claims")
+	}
+
+	username, ok := claims["username"].(string)
+	if !ok {
+		return "", fmt.Errorf("Invalid username in token claims")
+	}
+
+	return username, nil
+}
