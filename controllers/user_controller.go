@@ -9,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	"adventureride/models"
 	"adventureride/utils"
@@ -24,6 +25,23 @@ type Controller struct {
 	Collection *mongo.Collection
 }
 
+// CreateIndexes creates the necessary indexes for the MongoDB collection.
+func (ctrl *Controller) CreateIndexes() {
+	// Create a unique index on the username and email fields
+	indexModel := mongo.IndexModel{
+		Keys:    bson.M{"username": 1, "email": 1},
+		Options: options.Index().SetUnique(true),
+	}
+
+	_, err := ctrl.Collection.Indexes().CreateOne(context.TODO(), indexModel)
+	if err != nil {
+		fmt.Println("Error creating index:", err)
+		// Handle the error
+	} else {
+		fmt.Println("Index created successfully")
+	}
+}
+
 // TokenDetails holds the access token and refresh token.
 type TokenDetails struct {
 	AccessToken  string
@@ -37,30 +55,45 @@ const (
 )
 
 func (ctrl *Controller) RegisterHandler(c *gin.Context) {
-	var user models.User
-	err := c.ShouldBindJSON(&user)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
+    var user models.User
+    err := c.ShouldBindJSON(&user)
+    if err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
 
-	// Hash the password
-	hashedPassword, err := utils.HashPassword(user.Password)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Password hashing failed"})
-		return
-	}
+    // Check if the username or email already exists
+    existingUser := models.User{}
+    err = ctrl.Collection.FindOne(context.TODO(), bson.M{"$or": []bson.M{{"username": user.Username}, {"email": user.Email}}}).Decode(&existingUser)
+    if err == nil {
+        // User with the same username or email already exists
+        c.JSON(http.StatusConflict, gin.H{"error": "Username or email already in use"})
+        return
+    } else if err != mongo.ErrNoDocuments {
+        // Other error occurred
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Error checking existing user"})
+        return
+    }
 
-	// Store user information in MongoDB Atlas
-	user.Password = hashedPassword
-	_, err = ctrl.Collection.InsertOne(context.TODO(), user)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "User registration failed"})
-		return
-	}
+    // Hash the password
+    hashedPassword, err := utils.HashPassword(user.Password)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Password hashing failed"})
+        return
+    }
 
-	c.JSON(http.StatusCreated, gin.H{"message": "User registered"})
+    // Store user information in MongoDB
+    user.Password = hashedPassword
+    _, err = ctrl.Collection.InsertOne(context.TODO(), user)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "User registration failed"})
+        return
+    }
+
+    c.JSON(http.StatusCreated, gin.H{"message": "User registered"})
 }
+
+
 
 func (ctrl *Controller) LoginHandler(c *gin.Context) {
     var loginData struct {
